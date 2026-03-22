@@ -1,0 +1,110 @@
+name: Deploy payment-service to ECS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'payment-service/**'  # triggers only if payment-service folder changes
+      - '.github/workflows/payment-service-deploy-ecs.yml'  # also trigger when this workflow changes
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      TARGET_GROUP_NAME: ${{ vars.TARGET_GROUP_NAME }}
+      IMAGE_TAG: ${{ github.sha }}   # unique per commit
+
+    steps:
+      # 1️⃣ Checkout repo
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      # 2️⃣ Configure AWS credentials
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 3️⃣ Login to Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      # 4️⃣ Build and push Docker image
+      - name: Build and push Docker image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          REGISTRY_CLEAN="$(echo "$REGISTRY" | tr -d '\r\n' | xargs)"
+          ECR_REPOSITORY_CLEAN="$(echo "$ECR_REPOSITORY" | tr -d '\r\n' | xargs)"
+          IMAGE_TAG_CLEAN="$(echo "$IMAGE_TAG" | tr -d '\r\n' | xargs)"
+          IMAGE_URI="${REGISTRY_CLEAN}/${ECR_REPOSITORY_CLEAN}:${IMAGE_TAG_CLEAN}"
+
+          echo "Building Docker image: $IMAGE_URI"
+          docker build -t "$IMAGE_URI" ./payment-service
+          docker push "$IMAGE_URI"
+
+      # 5️⃣ Deploy to ECS with immediate stop of old tasks
+      - name: Deploy to ECS
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          REGISTRY_CLEAN="$(echo "$REGISTRY" | tr -d '\r\n' | xargs)"
+          ECR_REPOSITORY_CLEAN="$(echo "$ECR_REPOSITORY" | tr -d '\r\n' | xargs)"
+          IMAGE_TAG_CLEAN="$(echo "$IMAGE_TAG" | tr -d '\r\n' | xargs)"
+          ECS_CLUSTER_CLEAN="$(echo "$ECS_CLUSTER" | tr -d '\r\n' | xargs)"
+          ECS_SERVICE_CLEAN="$(echo "$ECS_SERVICE" | tr -d '\r\n' | xargs)"
+          ECS_TASK_FAMILY_CLEAN="$(echo "$ECS_TASK_FAMILY" | tr -d '\r\n' | xargs)"
+          IMAGE_URI="${REGISTRY_CLEAN}/${ECR_REPOSITORY_CLEAN}:${IMAGE_TAG_CLEAN}"
+
+          # Get current task definition
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY_CLEAN" > taskdef.json
+
+          # Update container image for correct container name
+          jq --arg IMAGE_URI "$IMAGE_URI" \
+            '.taskDefinition.containerDefinitions |= map(if .name=="payment-service" then .image=$IMAGE_URI else . end)
+             | {family: .taskDefinition.family,
+                containerDefinitions: .taskDefinition.containerDefinitions,
+                volumes: .taskDefinition.volumes,
+                taskRoleArn: (.taskDefinition.taskRoleArn // ""),
+                executionRoleArn: (.taskDefinition.executionRoleArn // ""),
+                networkMode: .taskDefinition.networkMode,
+                requiresCompatibilities: .taskDefinition.requiresCompatibilities,
+                cpu: .taskDefinition.cpu,
+                memory: .taskDefinition.memory}' \
+            taskdef.json > new-taskdef.json
+
+          # Register new task definition revision
+          NEW_REV=$(aws ecs register-task-definition --cli-input-json file://new-taskdef.json | jq -r '.taskDefinition.revision')
+          echo "New task definition revision: $NEW_REV"
+
+          # Update ECS service to use new revision & force deployment.
+          # AZ rebalancing requires maximumPercent > 100.
+          # Keep minimumHealthyPercent=0 to allow fast replacement of old tasks.
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER_CLEAN" \
+            --service "$ECS_SERVICE_CLEAN" \
+            --task-definition "$ECS_TASK_FAMILY_CLEAN:$NEW_REV" \
+            --force-new-deployment \
+            --deployment-configuration "maximumPercent=200,minimumHealthyPercent=0"
+
+          echo "ECS service updated with latest revision!"
+
+      # 6️⃣ Optional: Check ALB target group health
+      - name: Check ALB target group health
+        if: success()
+        run: |
+          TARGET_GROUP_NAME_CLEAN="$(echo "$TARGET_GROUP_NAME" | tr -d '\r\n' | xargs)"
+          TG_ARN=$(aws elbv2 describe-target-groups --names "$TARGET_GROUP_NAME_CLEAN" | jq -r '.TargetGroups[0].TargetGroupArn')
+          echo "Target group ARN: $TG_ARN"
+          aws elbv2 describe-target-health --target-group-arn "$TG_ARN"
+          

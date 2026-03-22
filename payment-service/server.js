@@ -16,7 +16,7 @@ app.use(
 );
 app.use(express.json());
 
-app.get('/health', (req, res) => {
+app.get('/payments/health', (req, res) => {
   return res.json({ status: 'ok', service: 'payment-service', timestamp: new Date().toISOString() });
 });
 
@@ -25,6 +25,7 @@ app.use('/payments', paymentRoutes);
 app.use((req, res) => {
   return res.status(404).json({ message: `Route ${req.originalUrl} not found` });
 });
+
 
 app.use((err, req, res, next) => {
   console.error('Unhandled Error:', err.message);
