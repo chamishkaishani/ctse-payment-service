@@ -26,7 +26,7 @@ router.post(
   processPayment
 );
 
-// GET /payments/:userId
+// GET /payments/:userIdf
 router.get(
   '/:userId',
   protect,
