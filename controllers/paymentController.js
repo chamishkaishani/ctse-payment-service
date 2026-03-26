@@ -1,4 +1,7 @@
 const { validationResult } = require('express-validator');
+
+const axios = require('axios');
+const ORDER_SERVICE_URL = process.env.ORDER_SERVICE_URL || 'http://order-service:5003';
 const Payment = require('../models/Payment');
 
 const buildTransactionId = () => `TXN-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
@@ -20,6 +23,23 @@ const processPayment = async (req, res) => {
   }
 
   try {
+    // Validate order existence and status from Order Service
+    let orderData;
+    try {
+      const response = await axios.get(`${ORDER_SERVICE_URL}/orders/${orderId}`, {
+        headers: { Authorization: req.headers.authorization },
+      });
+      orderData = response.data.order;
+    } catch (err) {
+      return res.status(404).json({ message: 'Order not found in Order Service' });
+    }
+    if (orderData.userId !== userId) {
+      return res.status(403).json({ message: 'Order does not belong to this user' });
+    }
+    if (orderData.orderStatus !== 'approved') {
+      return res.status(400).json({ message: 'Order is not approved for payment' });
+    }
+
     const payment = await Payment.create({
       orderId,
       userId,
@@ -29,6 +49,18 @@ const processPayment = async (req, res) => {
       paymentStatus: amount > 0 ? 'paid' : 'failed',
       transactionId: amount > 0 ? buildTransactionId() : null,
     });
+
+    // Update order status in Order Service after successful payment
+    if (payment.paymentStatus === 'paid') {
+      try {
+        await axios.put(`${ORDER_SERVICE_URL}/orders/${orderId}/status`, { status: 'paid' }, {
+          headers: { Authorization: req.headers.authorization },
+        });
+      } catch (err) {
+        // Log error but continue
+        console.error('Failed to update order status after payment');
+      }
+    }
 
     return res.status(201).json({
       success: true,
